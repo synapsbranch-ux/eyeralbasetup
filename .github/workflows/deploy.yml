@@ -1,0 +1,93 @@
+name: Deploy Ralbatech Website to S3
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+    # ------------------------------------------------------------------
+    # 1. SETUP & BUILD
+    # ------------------------------------------------------------------
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+        cache: 'npm'
+
+    - name: Install Dependencies
+      run: npm install --force
+
+    - name: Build Angular App
+      # Le build va créer le dossier dist/ralbatech-website/browser
+      run: npx ng build --configuration production
+
+    # ------------------------------------------------------------------
+    # 2. CONFIGURATION AWS
+    # ------------------------------------------------------------------
+    - name: Configure AWS Credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: us-east-1 # Assure-toi que c'est la bonne région
+
+    # ------------------------------------------------------------------
+    # 3. LOGIQUE AUTOMATIQUE (Création Bucket + Config + Deploy)
+    # ------------------------------------------------------------------
+    - name: Create Bucket (if missing) and Deploy
+      env:
+        BUCKET_NAME: ${{ secrets.AWS_S3_BUCKET }}
+        REGION: us-east-1
+        # C'est ici que j'ai mis ton chemin spécifique
+        BUILD_PATH: ./dist/ralbatech-website/browser
+      run: |
+        echo "🔍 Vérification du bucket : $BUCKET_NAME"
+
+        # Vérifie si le bucket existe
+        if aws s3api head-bucket --bucket "$BUCKET_NAME" 2>/dev/null; then
+          echo "✅ Le bucket existe déjà."
+        else
+          echo "⚠️ Création et configuration du bucket..."
+          
+          # A. Création
+          aws s3 mb "s3://$BUCKET_NAME" --region "$REGION"
+
+          # B. Débloquer l'accès public (Critique)
+          aws s3api put-public-access-block \
+            --bucket "$BUCKET_NAME" \
+            --public-access-block-configuration "BlockPublicAcls=false,IgnorePublicAcls=false,BlockPublicPolicy=false,RestrictPublicBuckets=false"
+
+          # C. Activer le mode Site Web (SPA Angular : error -> index.html)
+          aws s3 website "s3://$BUCKET_NAME" --index-document index.html --error-document index.html
+
+          # D. Appliquer la permission publique
+          POLICY_JSON='{"Version":"2012-10-17","Statement":[{"Sid":"PublicReadGetObject","Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::'"$BUCKET_NAME"'/*"}]}'
+          aws s3api put-bucket-policy --bucket "$BUCKET_NAME" --policy "$POLICY_JSON"
+          
+          echo "✅ Bucket configuré pour le public !"
+        fi
+
+        # ------------------------------------------------------------------
+        # 4. SYNCHRONISATION
+        # ------------------------------------------------------------------
+        echo "🚀 Envoi du contenu de $BUILD_PATH vers la racine du bucket..."
+        
+        if [ -d "$BUILD_PATH" ]; then
+          # On synchronise le CONTENU du dossier browser directement à la racine du bucket
+          aws s3 sync "$BUILD_PATH" "s3://$BUCKET_NAME" --delete
+          
+          echo "🎉 SUCCÈS ! Site en ligne : http://$BUCKET_NAME.s3-website-$REGION.amazonaws.com"
+        else
+          echo "❌ ERREUR : Le dossier '$BUILD_PATH' n'a pas été trouvé après le build."
+          echo "Liste du dossier dist pour débogage :"
+          ls -R dist/
+          exit 1
+        fi
